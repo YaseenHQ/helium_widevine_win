@@ -272,6 +272,30 @@ function Get-PeArchitecture {
     }
 }
 
+function Get-HostArchitecture {
+    $processor = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($processor) {
+        switch ([int]$processor.Architecture) {
+            0 { return 'x86' }
+            9 { return 'x64' }
+            12 { return 'arm64' }
+        }
+    }
+
+    $envArch = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+
+    switch ($envArch) {
+        'AMD64' { return 'x64' }
+        'x86'   { return 'x86' }
+        'ARM64' { return 'arm64' }
+        default { return 'x64' }
+    }
+}
+
 function Resolve-WidevineArchitecture {
     param(
         [string]$BinaryPath
@@ -287,10 +311,9 @@ function Resolve-WidevineArchitecture {
         }
     }
 
-    switch ($env:PROCESSOR_ARCHITECTURE) {
-        'AMD64' { return 'x64' }
+    switch (Get-HostArchitecture) {
         'x86'   { return 'x86' }
-        'ARM64' { return 'x64' }
+        'arm64' { return 'x64' }
         default { return 'x64' }
     }
 }
@@ -422,12 +445,7 @@ function New-WidevineUpdateRequestBody {
         [switch]$AllowSameVersionUpdate
     )
 
-    $osArch = switch ($env:PROCESSOR_ARCHITECTURE) {
-        'AMD64' { 'x64' }
-        'x86'   { 'x86' }
-        'ARM64' { 'arm64' }
-        default { 'x64' }
-    }
+    $osArch = Get-HostArchitecture
 
     $requestBody = @{
         request = @{
