@@ -1,15 +1,10 @@
-# chromium-widevine-windows
+# helium-widevine-windows
 
-Windows Widevine installer for Helium and other Chromium-style browsers.
+Windows Widevine installer for Helium.
 
 It downloads Widevine directly from Google's component update service, verifies
 the payload hash, extracts the CRX3, and installs a versioned `WidevineCdm`
-directory into the target profile.
-
-## Files
-
-- `install-widevine.cmd`
-- `use-from-google-chrome.ps1`
+directory into Helium's user data profile.
 
 ## Quick Start
 
@@ -37,21 +32,12 @@ Uninstall and remove backups:
 install-widevine.cmd -Uninstall -PurgeBackups
 ```
 
-## Common Options
-
-Install to a custom `WidevineCdm` path:
-
-```powershell
-PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
-  -Target Custom `
-  -TargetWidevineRoot "$env:LOCALAPPDATA\SomeBrowser\User Data\WidevineCdm"
-```
+## Options
 
 Use a nonstandard Helium binary path:
 
 ```powershell
 PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
-  -Target Helium `
   -TargetBinaryPath "D:\Apps\Helium\Application\chrome.exe"
 ```
 
@@ -71,17 +57,24 @@ PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
 
 ## Behavior
 
-- If the target browser is installed, the script uses that browser's version for
-  the update request.
-- If the target browser is missing and no `-ProductVersion` is provided, the
-  script falls back to the latest Windows Chrome stable version.
+- If Helium is installed, the script uses its version for the update request.
+- If Helium is missing and no `-ProductVersion` is provided, the script falls
+  back to the latest Windows Chrome stable version.
 - Replaced installs are moved to `WidevineCdm\_backup` by default.
 - Temporary download and extraction files are removed automatically unless
   `-KeepWorkDir` is used.
-- If multiple Helium or Chromium installs are detected, the script refuses to
-  guess and requires `-TargetBinaryPath`.
+- If multiple Helium installs are detected, the script refuses to guess and
+  requires `-TargetBinaryPath`.
 - `-Uninstall` only removes installs managed by this script. It uses a marker
   file and refuses to remove untracked layouts.
+- The Omaha update request sends OS version, architecture, and memory info to
+  Google as part of the standard update protocol.
+
+## Requirements
+
+- Windows (x64 or x86; ARM64 works via x64 emulation)
+- PowerShell 5.1 or later
+- Internet access to `clients2.google.com` and `versionhistory.googleapis.com`
 
 ## Scope
 

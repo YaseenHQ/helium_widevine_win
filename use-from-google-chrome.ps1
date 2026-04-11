@@ -1,3 +1,5 @@
+#Requires -Version 5.1
+
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [ValidateSet('Helium', 'Chromium', 'Custom')]
@@ -243,6 +245,56 @@ function Get-FileProductVersion {
     return $version
 }
 
+function Get-PeArchitecture {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    $reader = [System.IO.BinaryReader]::new($stream)
+
+    try {
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadUInt32()
+        $stream.Position = $peOffset + 4
+        $machine = $reader.ReadUInt16()
+
+        switch ($machine) {
+            0x014c { return 'x86' }
+            0x8664 { return 'x64' }
+            0xAA64 { return 'arm64' }
+            default { return $null }
+        }
+    } finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Resolve-WidevineArchitecture {
+    param(
+        [string]$BinaryPath
+    )
+
+    if ($BinaryPath -and (Test-Path -LiteralPath $BinaryPath)) {
+        $peArch = Get-PeArchitecture -Path $BinaryPath
+        if ($peArch -eq 'arm64') {
+            return 'x64'
+        }
+        if ($peArch) {
+            return $peArch
+        }
+    }
+
+    switch ($env:PROCESSOR_ARCHITECTURE) {
+        'AMD64' { return 'x64' }
+        'x86'   { return 'x86' }
+        'ARM64' { return 'x64' }
+        default { return 'x64' }
+    }
+}
+
 function Test-TargetRunning {
     param(
         [string]$BinaryPath
@@ -297,15 +349,19 @@ function Get-WidevineVersionInfo {
 function Test-WidevineLayout {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$VersionDirectory
+        [string]$VersionDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Architecture
     )
 
+    $platformDir = "win_$Architecture"
     $requiredPaths = @(
         'LICENSE',
         'manifest.json',
         '_metadata\verified_contents.json',
-        '_platform_specific\win_x64\widevinecdm.dll',
-        '_platform_specific\win_x64\widevinecdm.dll.sig'
+        "_platform_specific\$platformDir\widevinecdm.dll",
+        "_platform_specific\$platformDir\widevinecdm.dll.sig"
     )
 
     foreach ($relativePath in $requiredPaths) {
@@ -360,8 +416,18 @@ function New-WidevineUpdateRequestBody {
         [Parameter(Mandatory = $true)]
         [string]$InstalledWidevineVersion,
 
+        [Parameter(Mandatory = $true)]
+        [string]$Architecture,
+
         [switch]$AllowSameVersionUpdate
     )
+
+    $osArch = switch ($env:PROCESSOR_ARCHITECTURE) {
+        'AMD64' { 'x64' }
+        'x86'   { 'x86' }
+        'ARM64' { 'arm64' }
+        default { 'x64' }
+    }
 
     $requestBody = @{
         request = @{
@@ -375,11 +441,11 @@ function New-WidevineUpdateRequestBody {
             prodversion   = $ProductVersion
             updaterversion = $ProductVersion
             '@os'         = 'win'
-            arch          = 'x64'
+            arch          = $Architecture
             os            = @{
                 platform = 'win'
                 version  = Get-OsVersionString
-                arch     = 'x64'
+                arch     = $osArch
             }
             hw            = @{
                 physmemory = [math]::Max([int][math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB), 1)
@@ -389,7 +455,7 @@ function New-WidevineUpdateRequestBody {
                 ssse3      = $true
                 sse41      = $true
                 sse42      = $true
-                avx        = $true
+                avx        = $false
             }
             apps          = @(
                 @{
@@ -414,6 +480,9 @@ function Invoke-WidevineUpdateCheck {
         [Parameter(Mandatory = $true)]
         [string]$InstalledWidevineVersion,
 
+        [Parameter(Mandatory = $true)]
+        [string]$Architecture,
+
         [switch]$AllowSameVersionUpdate
     )
 
@@ -427,6 +496,7 @@ function Invoke-WidevineUpdateCheck {
     $body = New-WidevineUpdateRequestBody `
         -ProductVersion $ProductVersion `
         -InstalledWidevineVersion $InstalledWidevineVersion `
+        -Architecture $Architecture `
         -AllowSameVersionUpdate:$AllowSameVersionUpdate
 
     $response = Invoke-WebRequest `
@@ -652,7 +722,10 @@ function Remove-ManagedWidevine {
 
     $marker = Read-InstallerMarker -MarkerPath $MarkerPath
     if (-not $marker) {
-        throw "Installer marker not found at '$MarkerPath'. Refusing uninstall."
+        if (-not (Test-Path -LiteralPath $WidevineRoot)) {
+            throw "No Widevine installation found at '$WidevineRoot'. Nothing to uninstall."
+        }
+        throw "Widevine at '$WidevineRoot' was not installed by this script (no marker file). Remove it manually if needed."
     }
 
     $removedDirectories = New-Object System.Collections.Generic.List[string]
@@ -702,6 +775,7 @@ $targetWidevineRoot = Get-TargetWidevineRoot -ResolvedTarget $resolvedTarget -Ex
 $targetUserDataRoot = Get-TargetUserDataRoot -ResolvedTarget $resolvedTarget
 $resolvedBackupRoot = Get-BackupRoot -WidevineRoot $targetWidevineRoot -ExplicitPath $BackupRoot
 $installerMarkerPath = Get-InstallerMarkerPath -WidevineRoot $targetWidevineRoot
+$resolvedArchitecture = Resolve-WidevineArchitecture -BinaryPath $targetBinaryPath
 $productVersion = Resolve-ProductVersion -RequestedVersion $ProductVersion -TargetBinaryPath $targetBinaryPath
 $currentWidevine = Get-WidevineVersionInfo -WidevineRoot $targetWidevineRoot
 $installedWidevineVersion = if ($currentWidevine) { $currentWidevine.Version } else { '0.0.0.0' }
@@ -744,12 +818,13 @@ if ($Uninstall) {
 $updateApp = Invoke-WidevineUpdateCheck `
     -ProductVersion $productVersion `
     -InstalledWidevineVersion $installedWidevineVersion `
+    -Architecture $resolvedArchitecture `
     -AllowSameVersionUpdate:$Force
 
 $download = Resolve-WidevineDownload -UpdateApp $updateApp
 
 if (-not $download) {
-    if ($currentWidevine -and (Test-WidevineLayout -VersionDirectory $currentWidevine.VersionDirectory) -and -not $Force) {
+    if ($currentWidevine -and (Test-WidevineLayout -VersionDirectory $currentWidevine.VersionDirectory -Architecture $resolvedArchitecture) -and -not $Force) {
         [pscustomobject]@{
             Target               = $resolvedTarget
             TargetBinaryPath     = $targetBinaryPath
@@ -772,13 +847,13 @@ if (-not $download) {
         return
     }
 
-    throw "Google did not offer a Widevine update for product version '$productVersion'. Pass -ProductVersion from a supported Chromium build or install the target browser first."
+    throw "Google did not offer a Widevine update for product version '$productVersion' (arch=$resolvedArchitecture). Try -ProductVersion with a current stable Chrome version, or install the target browser first."
 }
 
 $destinationVersionDirectory = Join-Path $targetWidevineRoot $download.Version
 
 if ((Test-Path -LiteralPath $destinationVersionDirectory) -and
-    (Test-WidevineLayout -VersionDirectory $destinationVersionDirectory) -and
+    (Test-WidevineLayout -VersionDirectory $destinationVersionDirectory -Architecture $resolvedArchitecture) -and
     -not $Force) {
     [pscustomobject]@{
         Target               = $resolvedTarget
@@ -843,7 +918,7 @@ try {
         throw "Widevine manifest version '$manifestVersion' does not match the update response '$($download.Version)'."
     }
 
-    if (-not (Test-WidevineLayout -VersionDirectory $extractPath)) {
+    if (-not (Test-WidevineLayout -VersionDirectory $extractPath -Architecture $resolvedArchitecture)) {
         throw 'Extracted Widevine payload is missing required files.'
     }
 
