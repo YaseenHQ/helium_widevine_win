@@ -75,7 +75,7 @@ jobs:
           }
           Write-Host 'Installer smoke test passed.'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: release-artifacts
           path: dist/*
