@@ -43,6 +43,8 @@ $Repository = 'YaseenHQ/helium_widevine_win'
 $ProgressPreference = 'SilentlyContinue'
 
 function Get-ReleaseMetadata {
+    # "Metadata" is already singular; the analyzer's heuristic disagrees.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     param([string]$Tag)
 
     $uri = if ($Tag) {
