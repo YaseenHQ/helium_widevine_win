@@ -83,21 +83,21 @@ install-widevine.cmd -RemoveScheduledTask
 Use a nonstandard Helium binary path:
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
+PowerShell -ExecutionPolicy Bypass -File .\Install-Widevine.ps1 `
   -TargetBinaryPath "D:\Apps\Helium\Application\chrome.exe"
 ```
 
 Store backups somewhere else:
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
+PowerShell -ExecutionPolicy Bypass -File .\Install-Widevine.ps1 `
   -BackupRoot "$env:LOCALAPPDATA\helium-widevine-backups"
 ```
 
 Keep the temporary work directory:
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
+PowerShell -ExecutionPolicy Bypass -File .\Install-Widevine.ps1 `
   -KeepWorkDir
 ```
 

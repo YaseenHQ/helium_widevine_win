@@ -33,6 +33,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# PowerShell 5.1 inherits .NET's legacy default on some Windows builds, which
+# can still negotiate TLS 1.0. Google's endpoints require 1.2 or better.
+if ([Net.ServicePointManager]::SecurityProtocol -notmatch 'Tls12') {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+
 # Load up front with -WhatIf suppressed: lazy autoload would otherwise run the
 # module's own Set-Alias calls under -WhatIf and flood dry-run output.
 if (-not (Get-Module -Name CimCmdlets)) {
@@ -371,12 +378,20 @@ function Get-WidevineVersionInfo {
             continue
         }
 
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-        [pscustomobject]@{
-            VersionDirectory = $directory.FullName
-            Version          = [string]$manifest.version
-            ManifestPath     = $manifestPath
-            SortKey          = [version][string]$manifest.version
+        # One unreadable or malformed manifest must not abort discovery of the
+        # other installed versions.
+        try {
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            $manifestVersion = [string]$manifest.version
+            [pscustomobject]@{
+                VersionDirectory = $directory.FullName
+                Version          = $manifestVersion
+                ManifestPath     = $manifestPath
+                SortKey          = [version]$manifestVersion
+            }
+        } catch {
+            Write-Verbose "Skipping unreadable Widevine manifest '$manifestPath': $($_.Exception.Message)"
+            continue
         }
     }
 
@@ -407,6 +422,23 @@ function Test-WidevineLayout {
 
     foreach ($relativePath in $requiredPaths) {
         if (-not (Test-Path -LiteralPath (Join-Path $VersionDirectory $relativePath))) {
+            return $false
+        }
+    }
+
+    # Chromium's WidevineCdmComponentInstallerPolicy::VerifyInstallation rejects
+    # a CDM whose manifest lacks these keys, and a rejected component registers
+    # nothing at all -- silently, with no browser-side error. Catch it here
+    # instead, where we can say why.
+    try {
+        $manifest = Get-Content -LiteralPath (Join-Path $VersionDirectory 'manifest.json') -Raw | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+
+    foreach ($key in @('x-cdm-interface-versions', 'x-cdm-module-versions', 'x-cdm-codecs')) {
+        $property = $manifest.PSObject.Properties[$key]
+        if (-not $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
             return $false
         }
     }
@@ -450,6 +482,9 @@ function Get-OsVersionString {
 }
 
 function New-WidevineUpdateRequestBody {
+    # Builds and returns a JSON string; the New- verb implies no state change.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '')]
     param(
         [Parameter(Mandatory = $true)]
         [string]$ProductVersion,
@@ -634,7 +669,60 @@ function Expand-Crx3Archive {
         $inputStream.Dispose()
     }
 
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $DestinationPath -Force
+    Expand-ZipArchive -ZipPath $zipPath -DestinationPath $DestinationPath
+}
+
+function Expand-ZipArchive {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ZipPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null
+    $destinationRoot = [System.IO.Path]::GetFullPath(
+        (Resolve-Path -LiteralPath $DestinationPath).Path.TrimEnd('\') + '\')
+
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        # Validate every entry before writing anything: a crafted archive must
+        # not be able to place files outside the destination (zip slip).
+        foreach ($entry in $archive.Entries) {
+            if ([string]::IsNullOrEmpty($entry.Name)) {
+                continue
+            }
+
+            $target = [System.IO.Path]::GetFullPath(
+                [System.IO.Path]::Combine($destinationRoot, $entry.FullName))
+
+            if (-not $target.StartsWith($destinationRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Archive entry '$($entry.FullName)' resolves outside the destination directory."
+            }
+        }
+
+        foreach ($entry in $archive.Entries) {
+            $target = [System.IO.Path]::GetFullPath(
+                [System.IO.Path]::Combine($destinationRoot, $entry.FullName))
+
+            if ([string]::IsNullOrEmpty($entry.Name)) {
+                New-Item -ItemType Directory -Force -Path $target | Out-Null
+                continue
+            }
+
+            $parent = [System.IO.Path]::GetDirectoryName($target)
+            if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            }
+
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+        }
+    } finally {
+        $archive.Dispose()
+    }
 }
 
 function Get-WidevineManifestVersion {
@@ -786,6 +874,10 @@ function Read-InstallerMarker {
 }
 
 function Remove-ManagedWidevine {
+    # Dry-run support is threaded through the caller's own ShouldProcess result
+    # and passed in as -WhatIfMode, so this does not declare SupportsShouldProcess.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '')]
     param(
         [Parameter(Mandatory = $true)]
         [string]$ResolvedTarget,
@@ -930,6 +1022,12 @@ function Unregister-WidevineUpdateTask {
 
     Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false
     return $true
+}
+
+# Dot-sourcing this file loads its functions for testing without running the
+# installer. Everything above this line is declarations; everything below acts.
+if ($MyInvocation.InvocationName -eq '.') {
+    return
 }
 
 $resolvedTarget = $Target
@@ -1080,7 +1178,6 @@ if ((Test-Path -LiteralPath $destinationVersionDirectory) -and
 
 $workRoot = Join-Path $env:TEMP ("widevine-download-" + [guid]::NewGuid().ToString('N'))
 $crxPath = Join-Path $workRoot 'widevine.crx3'
-$extractPath = Join-Path $workRoot 'extracted'
 
 $action = "Install Widevine $($download.Version) into '$targetWidevineRoot'"
 if (-not $PSCmdlet.ShouldProcess($targetWidevineRoot, $action)) {
