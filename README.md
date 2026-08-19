@@ -59,6 +59,25 @@ Uninstall and remove backups:
 install-widevine.cmd -Uninstall -PurgeBackups
 ```
 
+## Keeping it up to date
+
+Google ships new Widevine builds periodically, so a one-off install will fall
+behind. The installer can register a scheduled task that re-runs it:
+
+```cmd
+install-widevine.cmd -InstallScheduledTask
+```
+
+The task runs weekly (Sunday 03:00) and at logon, as the current user, with no
+window. If Helium is running when it fires, it exits cleanly and retries on the
+next trigger instead of reporting a failure.
+
+Remove it with:
+
+```cmd
+install-widevine.cmd -RemoveScheduledTask
+```
+
 ## Options
 
 Use a nonstandard Helium binary path:

@@ -21,7 +21,13 @@ param(
 
     [switch]$NoBackup,
 
-    [switch]$PurgeBackups
+    [switch]$PurgeBackups,
+
+    [switch]$InstallScheduledTask,
+
+    [switch]$RemoveScheduledTask,
+
+    [switch]$SkipIfBrowserRunning
 )
 
 Set-StrictMode -Version Latest
@@ -850,6 +856,82 @@ function Remove-ManagedWidevine {
     }
 }
 
+$ScheduledTaskName = 'HeliumWidevineUpdate'
+
+function Register-WidevineUpdateTask {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ResolvedTarget,
+
+        [string]$ResolvedBinaryPath
+    )
+
+    if (-not (Get-Command -Name Register-ScheduledTask -ErrorAction SilentlyContinue)) {
+        throw 'The ScheduledTasks module is unavailable, so the update task cannot be registered.'
+    }
+
+    $argumentList = @(
+        '-NoProfile'
+        '-ExecutionPolicy'
+        'Bypass'
+        '-WindowStyle'
+        'Hidden'
+        '-File'
+        ('"{0}"' -f $ScriptPath)
+        '-Target'
+        $ResolvedTarget
+        '-SkipIfBrowserRunning'
+    )
+
+    if ($ResolvedBinaryPath) {
+        $argumentList += @('-TargetBinaryPath', ('"{0}"' -f $ResolvedBinaryPath))
+    }
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($argumentList -join ' ')
+
+    # Weekly, plus a logon trigger so a machine that was off still catches up.
+    $triggers = @(
+        (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '03:00')
+        (New-ScheduledTaskTrigger -AtLogOn)
+    )
+
+    $settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 30) `
+        -MultipleInstances IgnoreNew
+
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+        -LogonType Interactive
+
+    Register-ScheduledTask `
+        -TaskName $ScheduledTaskName `
+        -Action $action `
+        -Trigger $triggers `
+        -Settings $settings `
+        -Principal $principal `
+        -Description 'Keeps the Widevine CDM in Helium current with Google component releases.' `
+        -Force | Out-Null
+
+    return $ScheduledTaskName
+}
+
+function Unregister-WidevineUpdateTask {
+    if (-not (Get-Command -Name Unregister-ScheduledTask -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    if (-not (Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false
+    return $true
+}
+
 $resolvedTarget = $Target
 $targetBinaryPath = Get-TargetBinaryPath -ResolvedTarget $resolvedTarget -ExplicitPath $TargetBinaryPath
 $targetWidevineRoot = Get-TargetWidevineRoot -ResolvedTarget $resolvedTarget -ExplicitPath $TargetWidevineRoot
@@ -861,8 +943,45 @@ $productVersion = Resolve-ProductVersion -RequestedVersion $ProductVersion -Targ
 $currentWidevine = Get-WidevineVersionInfo -WidevineRoot $targetWidevineRoot
 $installedWidevineVersion = if ($currentWidevine) { $currentWidevine.Version } else { '0.0.0.0' }
 
+if ($RemoveScheduledTask) {
+    [pscustomobject]@{
+        ScheduledTask = $ScheduledTaskName
+        Removed       = (Unregister-WidevineUpdateTask)
+    }
+
+    if (-not $InstallScheduledTask) {
+        return
+    }
+}
+
 if (-not $WhatIfPreference -and $targetBinaryPath -and (Test-TargetRunning -BinaryPath $targetBinaryPath)) {
+    # The scheduled task runs unattended, where a running browser is an ordinary
+    # "try again later" rather than a failure worth reporting to Task Scheduler.
+    if ($SkipIfBrowserRunning) {
+        [pscustomobject]@{
+            Target           = $resolvedTarget
+            TargetBinaryPath = $targetBinaryPath
+            Changed          = $false
+            Skipped          = 'Target browser is running.'
+        }
+        return
+    }
+
     throw "Close the target browser before installing Widevine. Running binary: '$targetBinaryPath'."
+}
+
+if ($InstallScheduledTask) {
+    $registeredTask = Register-WidevineUpdateTask `
+        -ScriptPath $PSCommandPath `
+        -ResolvedTarget $resolvedTarget `
+        -ResolvedBinaryPath $targetBinaryPath
+
+    [pscustomobject]@{
+        ScheduledTask = $registeredTask
+        Registered    = $true
+        RunsAs        = ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+        Schedule      = 'Weekly (Sunday 03:00) and at logon'
+    }
 }
 
 if ($Uninstall) {
