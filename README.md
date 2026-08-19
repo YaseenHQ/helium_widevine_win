@@ -46,7 +46,9 @@ winget install YaseenHQ.HeliumWidevine
 no admin required. Setup offers to install Widevine and register the
 auto-update task, and uninstall reverses both.
 
-**One-liner**
+**Portable** — download the `-portable.zip` from Releases and extract it.
+
+**One-liner** — convenient, but see the note below.
 
 ```powershell
 irm https://raw.githubusercontent.com/YaseenHQ/helium_widevine_win/main/install.ps1 | iex
@@ -59,7 +61,10 @@ This resolves the latest release, verifies the payload against the published
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/YaseenHQ/helium_widevine_win/main/install.ps1))) -InstallScheduledTask
 ```
 
-**Portable** — download the `-portable.zip` from Releases and extract it.
+> Antivirus commonly flags `irm ... | iex` regardless of what it fetches,
+> because download-and-execute one-liners are a known malware delivery pattern.
+> Prefer the installer or portable zip if that matters to you. See
+> [If antivirus or SmartScreen complains](#if-antivirus-or-smartscreen-complains).
 
 Every release ships a `checksums.txt`; verify your download against it.
 
@@ -150,6 +155,42 @@ PowerShell -ExecutionPolicy Bypass -File .\Install-Widevine.ps1 `
   the key embedded in the archive and requires it to match Widevine's component
   ID, so a payload that Google did not sign is refused even if the update
   response vouched for it.
+
+## If antivirus or SmartScreen complains
+
+Expect this, and expect it to be a false positive. This tool does three things
+heuristic scanners treat as suspicious in combination: it downloads a binary
+from the internet, writes a DLL into a browser's directory, and (via the
+one-liner) runs a script fetched over the network.
+
+Common reports:
+
+- **`Trojan:Win32/ClickFix.*`** on the `irm ... | iex` one-liner. ClickFix is a
+  social-engineering technique whose payload is a download-and-execute
+  one-liner, so the shape matches even though the source and behaviour do not.
+  If this bothers you, use the installer or the portable zip instead; the
+  one-liner is a convenience, not the recommended path.
+- **SmartScreen "Windows protected your PC"** on the installer. The releases are
+  not code-signed yet, and SmartScreen reputation is earned per-signature over
+  time. Click *More info* then *Run anyway*, or verify the download against
+  `checksums.txt` first.
+
+What you can verify yourself, rather than taking the above on trust:
+
+- Every release ships a `checksums.txt`. Compare it with
+  `Get-FileHash <file> -Algorithm SHA256`.
+- The CDM itself is fetched from Google's own component update service, the
+  same endpoint Chrome uses, and is checked twice: against the SHA-256 in the
+  update response, and against Google's CRX3 signature.
+- The whole thing is a readable PowerShell script. Nothing is compiled or
+  obfuscated, so you can audit exactly what it does before running it.
+
+If you would rather not run any of it unattended, `-WhatIf` shows what would
+happen and changes nothing:
+
+```cmd
+install-widevine.cmd -WhatIf
+```
 
 ## Building a release
 
