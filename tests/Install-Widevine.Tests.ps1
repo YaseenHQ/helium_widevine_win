@@ -183,6 +183,86 @@ Describe 'Expand-ZipArchive' {
     }
 }
 
+Describe 'ConvertTo-CrxExtensionId' {
+    It 'maps a known key to its Chromium extension ID' {
+        # SHA-256 of bytes 1..32, first 16 bytes, each nibble mapped 0-f -> a-p.
+        ConvertTo-CrxExtensionId -SubjectPublicKeyInfo ([byte[]](1..32)) |
+            Should -Be 'kocbgmcopfcehkdhicmbdfopkchjkdoe'
+    }
+
+    It 'always produces 32 characters in the a-p alphabet' {
+        $id = ConvertTo-CrxExtensionId -SubjectPublicKeyInfo ([byte[]](1..64))
+        $id.Length | Should -Be 32
+        $id | Should -Match '^[a-p]{32}$'
+    }
+}
+
+Describe 'ConvertFrom-DerUnsignedInteger' {
+    It 'strips the DER sign-padding byte' {
+        ConvertFrom-DerUnsignedInteger -Bytes ([byte[]]@(0x00, 0xFF, 0x01)) |
+            Should -Be ([byte[]]@(0xFF, 0x01))
+    }
+
+    It 'leaves an unpadded value alone' {
+        ConvertFrom-DerUnsignedInteger -Bytes ([byte[]]@(0x01, 0x00, 0x01)) |
+            Should -Be ([byte[]]@(0x01, 0x00, 0x01))
+    }
+
+    It 'preserves a single zero byte rather than emptying it' {
+        ConvertFrom-DerUnsignedInteger -Bytes ([byte[]]@(0x00)) | Should -Be ([byte[]]@(0x00))
+    }
+}
+
+Describe 'Read-ProtobufFields' {
+    It 'reads a length-delimited field' {
+        # Field 1, wire type 2, length 3, "abc"
+        $fields = Read-ProtobufFields -Data ([byte[]]@(0x0A, 0x03, 0x61, 0x62, 0x63))
+        $fields.Count | Should -Be 1
+        $fields[0].FieldNumber | Should -Be 1
+        [System.Text.Encoding]::ASCII.GetString($fields[0].Value) | Should -Be 'abc'
+    }
+
+    It 'reads high field numbers that need a multi-byte key varint' {
+        # Field 10000 (signed_header_data), wire type 2, length 1, 0x07.
+        # Key varint = (10000 << 3) | 2 = 80002 -> 0x82 0xF1 0x04
+        $fields = Read-ProtobufFields -Data ([byte[]]@(0x82, 0xF1, 0x04, 0x01, 0x07))
+        $fields[0].FieldNumber | Should -Be 10000
+        $fields[0].Value | Should -Be ([byte[]]@(0x07))
+    }
+
+    It 'skips varint fields without treating them as data' {
+        # Field 1 varint = 300, then field 2 length-delimited "hi"
+        $fields = Read-ProtobufFields -Data ([byte[]]@(0x08, 0xAC, 0x02, 0x12, 0x02, 0x68, 0x69))
+        $fields.Count | Should -Be 1
+        $fields[0].FieldNumber | Should -Be 2
+        [System.Text.Encoding]::ASCII.GetString($fields[0].Value) | Should -Be 'hi'
+    }
+
+    It 'rejects a field whose length overruns the buffer' {
+        { Read-ProtobufFields -Data ([byte[]]@(0x0A, 0x7F, 0x61)) } | Should -Throw '*overruns*'
+    }
+}
+
+Describe 'Test-Crx3Signature' {
+    It 'rejects a file that is not a CRX' {
+        $file = Join-Path $TestDrive 'not.crx3'
+        [System.IO.File]::WriteAllBytes($file, [byte[]](1..64))
+        { Test-Crx3Signature -CrxPath $file -ExpectedExtensionId ('a' * 32) } |
+            Should -Throw '*not a CRX archive*'
+    }
+
+    It 'rejects an unsupported CRX version' {
+        $file = Join-Path $TestDrive 'v2.crx3'
+        $bytes = [System.Collections.Generic.List[byte]]::new()
+        $bytes.AddRange([System.Text.Encoding]::ASCII.GetBytes('Cr24'))
+        $bytes.AddRange([System.BitConverter]::GetBytes([uint32]2))
+        $bytes.AddRange([System.BitConverter]::GetBytes([uint32]0))
+        [System.IO.File]::WriteAllBytes($file, $bytes.ToArray())
+        { Test-Crx3Signature -CrxPath $file -ExpectedExtensionId ('a' * 32) } |
+            Should -Throw "*Unsupported CRX version '2'*"
+    }
+}
+
 Describe 'Get-WidevineVersionInfo' {
     It 'skips a malformed manifest instead of aborting discovery' {
         $root = Join-Path $TestDrive 'root'

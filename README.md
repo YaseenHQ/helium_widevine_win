@@ -3,8 +3,8 @@
 Windows Widevine installer for Helium.
 
 It downloads Widevine directly from Google's component update service, verifies
-the payload hash, extracts the CRX3, and installs a versioned `WidevineCdm`
-directory into Helium's user data profile.
+the payload hash *and Google's CRX3 signature*, extracts the archive, and
+installs a versioned `WidevineCdm` directory into Helium's user data profile.
 
 ## What you get, and what you don't
 
@@ -115,6 +115,11 @@ PowerShell -ExecutionPolicy Bypass -File .\Install-Widevine.ps1 `
   file and refuses to remove untracked layouts.
 - The Omaha update request sends OS version, architecture, and memory info to
   Google as part of the standard update protocol.
+- Downloads are checked twice: the SHA-256 from the update response, and the
+  CRX3 signature. The signature check derives the publisher's extension ID from
+  the key embedded in the archive and requires it to match Widevine's component
+  ID, so a payload that Google did not sign is refused even if the update
+  response vouched for it.
 
 ## Requirements
 

@@ -631,6 +631,323 @@ function Resolve-WidevineDownload {
     }
 }
 
+function Read-Asn1Length {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Data,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$Offset
+    )
+
+    $first = $Data[$Offset.Value]
+    $Offset.Value++
+
+    if ($first -lt 0x80) {
+        return [int]$first
+    }
+
+    $byteCount = $first -band 0x7F
+    if ($byteCount -eq 0 -or $byteCount -gt 4) {
+        throw 'Unsupported ASN.1 length encoding in the CRX public key.'
+    }
+
+    $length = 0
+    for ($i = 0; $i -lt $byteCount; $i++) {
+        $length = ($length -shl 8) -bor $Data[$Offset.Value]
+        $Offset.Value++
+    }
+
+    return $length
+}
+
+function Read-Asn1Tag {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Data,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$Offset,
+
+        [Parameter(Mandatory = $true)]
+        [byte]$Expected,
+
+        [Parameter(Mandatory = $true)]
+        [string]$What
+    )
+
+    if ($Data[$Offset.Value] -ne $Expected) {
+        throw ("Malformed CRX public key: expected {0} (tag 0x{1:X2}) but found 0x{2:X2}." -f
+            $What, $Expected, $Data[$Offset.Value])
+    }
+
+    $Offset.Value++
+    return (Read-Asn1Length -Data $Data -Offset $Offset)
+}
+
+function ConvertFrom-DerUnsignedInteger {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Bytes
+    )
+
+    # DER stores a leading zero byte to keep the value positive; RSAParameters
+    # wants the raw magnitude without it.
+    $start = 0
+    while ($start -lt ($Bytes.Length - 1) -and $Bytes[$start] -eq 0) {
+        $start++
+    }
+
+    return $Bytes[$start..($Bytes.Length - 1)]
+}
+
+function Get-RsaParametersFromSpki {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$SubjectPublicKeyInfo
+    )
+
+    # .NET Framework (which drives PowerShell 5.1) has no
+    # RSA.ImportSubjectPublicKeyInfo, so unwrap the DER by hand:
+    #   SEQUENCE { AlgorithmIdentifier, BIT STRING { RSAPublicKey } }
+    #   RSAPublicKey ::= SEQUENCE { INTEGER modulus, INTEGER publicExponent }
+    $offset = 0
+    [void](Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x30 -What 'SubjectPublicKeyInfo')
+
+    $algorithmLength = Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x30 -What 'AlgorithmIdentifier'
+    $offset += $algorithmLength
+
+    [void](Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x03 -What 'subjectPublicKey BIT STRING')
+    if ($SubjectPublicKeyInfo[$offset] -ne 0) {
+        throw 'Malformed CRX public key: unexpected unused-bit count in the BIT STRING.'
+    }
+    $offset++
+
+    [void](Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x30 -What 'RSAPublicKey')
+
+    $modulusLength = Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x02 -What 'modulus'
+    $modulus = $SubjectPublicKeyInfo[$offset..($offset + $modulusLength - 1)]
+    $offset += $modulusLength
+
+    $exponentLength = Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x02 -What 'publicExponent'
+    $exponent = $SubjectPublicKeyInfo[$offset..($offset + $exponentLength - 1)]
+
+    $parameters = New-Object System.Security.Cryptography.RSAParameters
+    $parameters.Modulus = ConvertFrom-DerUnsignedInteger -Bytes $modulus
+    $parameters.Exponent = ConvertFrom-DerUnsignedInteger -Bytes $exponent
+    return $parameters
+}
+
+function ConvertTo-CrxExtensionId {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$SubjectPublicKeyInfo
+    )
+
+    # A Chromium extension/component ID is the first 16 bytes of the SHA-256 of
+    # the DER public key, with each nibble mapped 0-f onto a-p.
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha256.ComputeHash($SubjectPublicKeyInfo)
+    } finally {
+        $sha256.Dispose()
+    }
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($byte in $digest[0..15]) {
+        [void]$builder.Append([char](97 + ($byte -shr 4)))
+        [void]$builder.Append([char](97 + ($byte -band 0x0F)))
+    }
+
+    return $builder.ToString()
+}
+
+function Read-ProtobufFields {
+    # Plural is deliberate: this returns every field in the message.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Data
+    )
+
+    $fields = New-Object System.Collections.Generic.List[psobject]
+    $offset = 0
+
+    while ($offset -lt $Data.Length) {
+        # Field key varint: (fieldNumber << 3) | wireType
+        $key = [uint64]0
+        $shift = 0
+        do {
+            if ($offset -ge $Data.Length) {
+                throw 'Truncated CRX header: incomplete field key.'
+            }
+            $current = $Data[$offset]
+            $offset++
+            $key = $key -bor ([uint64]($current -band 0x7F) -shl $shift)
+            $shift += 7
+        } while ($current -band 0x80)
+
+        $fieldNumber = [int]($key -shr 3)
+        $wireType = [int]($key -band 0x07)
+
+        switch ($wireType) {
+            0 {
+                # Varint value; skip it.
+                do {
+                    $current = $Data[$offset]
+                    $offset++
+                } while ($current -band 0x80)
+            }
+            2 {
+                $length = [int]0
+                $shift = 0
+                do {
+                    $current = $Data[$offset]
+                    $offset++
+                    $length = $length -bor (($current -band 0x7F) -shl $shift)
+                    $shift += 7
+                } while ($current -band 0x80)
+
+                if (($offset + $length) -gt $Data.Length) {
+                    throw 'Truncated CRX header: length-delimited field overruns the buffer.'
+                }
+
+                $value = if ($length -eq 0) { , [byte[]]@() } else { , [byte[]]$Data[$offset..($offset + $length - 1)] }
+                $offset += $length
+
+                $fields.Add([pscustomobject]@{
+                    FieldNumber = $fieldNumber
+                    Value       = $value
+                })
+            }
+            5 { $offset += 4 }
+            1 { $offset += 8 }
+            default {
+                throw "Unsupported protobuf wire type '$wireType' in the CRX header."
+            }
+        }
+    }
+
+    return $fields
+}
+
+function Test-Crx3Signature {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CrxPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedExtensionId
+    )
+
+    $stream = [System.IO.File]::OpenRead($CrxPath)
+    $reader = [System.IO.BinaryReader]::new($stream)
+
+    try {
+        if ([System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4)) -ne 'Cr24') {
+            throw 'Downloaded file is not a CRX archive.'
+        }
+
+        $crxVersion = $reader.ReadUInt32()
+        if ($crxVersion -ne 3) {
+            throw "Unsupported CRX version '$crxVersion'."
+        }
+
+        $headerSize = $reader.ReadUInt32()
+        $headerBytes = $reader.ReadBytes($headerSize)
+        if ($headerBytes.Length -ne $headerSize) {
+            throw 'Truncated CRX header.'
+        }
+
+        $payloadOffset = 12 + $headerSize
+        $fields = Read-ProtobufFields -Data $headerBytes
+
+        # CrxFileHeader field 10000 is signed_header_data (a SignedData message
+        # whose field 1 is the 16-byte crx_id); field 2 is the repeated
+        # sha256_with_rsa proof list.
+        $signedHeaderData = ($fields | Where-Object { $_.FieldNumber -eq 10000 } | Select-Object -First 1).Value
+        if ($null -eq $signedHeaderData) {
+            throw 'CRX header does not contain signed header data.'
+        }
+
+        $rsaProofs = @($fields | Where-Object { $_.FieldNumber -eq 2 })
+        if ($rsaProofs.Count -eq 0) {
+            throw 'CRX header does not contain an RSA signature proof.'
+        }
+
+        # The signature covers a domain-separated prefix, then the signed header
+        # data, then the ZIP payload.
+        $prefix = [System.Collections.Generic.List[byte]]::new()
+        $prefix.AddRange([System.Text.Encoding]::ASCII.GetBytes('CRX3 SignedData'))
+        $prefix.Add(0)
+        $prefix.AddRange([System.BitConverter]::GetBytes([uint32]$signedHeaderData.Length))
+        $prefix.AddRange($signedHeaderData)
+
+        $matchedId = $false
+        foreach ($proof in $rsaProofs) {
+            $proofFields = Read-ProtobufFields -Data $proof.Value
+            $publicKey = ($proofFields | Where-Object { $_.FieldNumber -eq 1 } | Select-Object -First 1).Value
+            $signature = ($proofFields | Where-Object { $_.FieldNumber -eq 2 } | Select-Object -First 1).Value
+
+            if ($null -eq $publicKey -or $null -eq $signature) {
+                continue
+            }
+
+            $extensionId = ConvertTo-CrxExtensionId -SubjectPublicKeyInfo $publicKey
+            if ($extensionId -ne $ExpectedExtensionId) {
+                continue
+            }
+
+            $matchedId = $true
+
+            # Hash incrementally: the payload is ~22 MB and need not be buffered.
+            $hasher = [System.Security.Cryptography.IncrementalHash]::CreateHash(
+                [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+            try {
+                $hasher.AppendData($prefix.ToArray())
+
+                $stream.Position = $payloadOffset
+                $buffer = New-Object byte[] 1048576
+                while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $hasher.AppendData($buffer, 0, $read)
+                }
+
+                $digest = $hasher.GetHashAndReset()
+            } finally {
+                $hasher.Dispose()
+            }
+
+            $rsa = [System.Security.Cryptography.RSA]::Create()
+            try {
+                $rsa.ImportParameters((Get-RsaParametersFromSpki -SubjectPublicKeyInfo $publicKey))
+                $verified = $rsa.VerifyHash(
+                    $digest,
+                    $signature,
+                    [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+                    [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+            } finally {
+                $rsa.Dispose()
+            }
+
+            if (-not $verified) {
+                throw "CRX signature verification failed for extension ID '$ExpectedExtensionId'."
+            }
+
+            return $true
+        }
+
+        if (-not $matchedId) {
+            throw ("No CRX signature was issued by the expected publisher. " +
+                "Extension ID '$ExpectedExtensionId' was not among the signing keys.")
+        }
+    } finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+
+    return $false
+}
+
 function Expand-Crx3Archive {
     param(
         [Parameter(Mandatory = $true)]
@@ -1209,6 +1526,10 @@ try {
         -Urls $download.Urls `
         -DestinationPath $crxPath `
         -ExpectedSha256 $download.Sha256
+
+    # The SHA-256 above only proves the bytes match what the update server
+    # described. This proves Google actually signed them.
+    [void](Test-Crx3Signature -CrxPath $crxPath -ExpectedExtensionId $WidevineAppId)
 
     Expand-Crx3Archive -CrxPath $crxPath -DestinationPath $stagePath
 
