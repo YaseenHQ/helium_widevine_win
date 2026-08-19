@@ -27,6 +27,18 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Load up front with -WhatIf suppressed: lazy autoload would otherwise run the
+# module's own Set-Alias calls under -WhatIf and flood dry-run output.
+if (-not (Get-Module -Name CimCmdlets)) {
+    $previousWhatIfPreference = $WhatIfPreference
+    $WhatIfPreference = $false
+    try {
+        Import-Module CimCmdlets -ErrorAction SilentlyContinue | Out-Null
+    } finally {
+        $WhatIfPreference = $previousWhatIfPreference
+    }
+}
+
 $WidevineAppId = 'oimompecagnajdejgnnjijobebaeigek'
 $WidevineUpdateUrl = 'https://clients2.google.com/service/update2/json'
 $ChromeStableVersionUrl = 'https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/stable/versions?pageSize=1'
@@ -301,11 +313,11 @@ function Resolve-WidevineArchitecture {
         [string]$BinaryPath
     )
 
+    # Google publishes a distinct win_arm64 Widevine package, and Helium ships a
+    # native ARM64 build. Resolving arm64 to x64 installs a CDM the browser
+    # cannot load, so mirror the target binary's real architecture.
     if ($BinaryPath -and (Test-Path -LiteralPath $BinaryPath)) {
         $peArch = Get-PeArchitecture -Path $BinaryPath
-        if ($peArch -eq 'arm64') {
-            return 'x64'
-        }
         if ($peArch) {
             return $peArch
         }
@@ -313,7 +325,7 @@ function Resolve-WidevineArchitecture {
 
     switch (Get-HostArchitecture) {
         'x86'   { return 'x86' }
-        'arm64' { return 'x64' }
+        'arm64' { return 'arm64' }
         default { return 'x64' }
     }
 }
@@ -397,7 +409,7 @@ function Test-WidevineLayout {
 }
 
 function Get-LatestStableChromeVersion {
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $ChromeStableVersionUrl
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $ChromeStableVersionUrl -TimeoutSec 30
     $payload = $response.Content | ConvertFrom-Json
     $version = $payload.versions[0].version
 
@@ -522,7 +534,8 @@ function Invoke-WidevineUpdateCheck {
         -Method Post `
         -Uri $WidevineUpdateUrl `
         -Headers $headers `
-        -Body $body
+        -Body $body `
+        -TimeoutSec 30
 
     $jsonText = (($response.Content -split "`r?`n") | Select-Object -Skip 1) -join "`n"
     $payload = $jsonText | ConvertFrom-Json
@@ -554,19 +567,26 @@ function Resolve-WidevineDownload {
         throw 'Widevine update response did not include a download operation.'
     }
 
-    $downloadUrl = $downloadOperation.urls |
+    # Google returns each mirror twice (http then https). Keep every HTTPS
+    # mirror so a single unreachable host does not fail the install.
+    $downloadUrls = @($downloadOperation.urls |
         ForEach-Object { $_.url } |
-        Where-Object { $_ -like 'https://*' } |
-        Select-Object -First 1
+        Where-Object { $_ -like 'https://*' })
 
-    if (-not $downloadUrl) {
+    if ($downloadUrls.Count -eq 0) {
         throw 'Widevine update response did not include a usable HTTPS download URL.'
+    }
+
+    $expectedSha256 = [string]$downloadOperation.out.sha256
+    if ([string]::IsNullOrWhiteSpace($expectedSha256)) {
+        throw 'Widevine update response did not include a SHA-256 for the payload.'
     }
 
     return [pscustomobject]@{
         Version = [string]$UpdateApp.updatecheck.nextversion
-        Url     = $downloadUrl
-        Sha256  = [string]$downloadOperation.out.sha256
+        Urls    = $downloadUrls
+        Url     = $downloadUrls[0]
+        Sha256  = $expectedSha256
     }
 }
 
@@ -623,6 +643,49 @@ function Get-WidevineManifestVersion {
     }
 
     return [string](Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).version
+}
+
+function Invoke-WidevineDownload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Urls,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedSha256
+    )
+
+    $expected = $ExpectedSha256.ToLowerInvariant()
+    $failures = New-Object System.Collections.Generic.List[string]
+
+    # Invoke-WebRequest renders a progress bar per chunk on PowerShell 5.1,
+    # which dominates runtime on multi-megabyte downloads.
+    $previousProgress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        foreach ($url in $Urls) {
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $DestinationPath -TimeoutSec 120
+            } catch {
+                $failures.Add("$url : $($_.Exception.Message)")
+                continue
+            }
+
+            $actual = Get-Sha256Hex -Path $DestinationPath
+            if ($actual -eq $expected) {
+                return $url
+            }
+
+            $failures.Add("$url : hash mismatch (expected '$expected', got '$actual')")
+            Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        $ProgressPreference = $previousProgress
+    }
+
+    throw "Widevine download failed from all $($Urls.Count) mirror(s):`n  " + ($failures -join "`n  ")
 }
 
 function Get-Sha256Hex {
@@ -798,7 +861,7 @@ $productVersion = Resolve-ProductVersion -RequestedVersion $ProductVersion -Targ
 $currentWidevine = Get-WidevineVersionInfo -WidevineRoot $targetWidevineRoot
 $installedWidevineVersion = if ($currentWidevine) { $currentWidevine.Version } else { '0.0.0.0' }
 
-if ($targetBinaryPath -and (Test-TargetRunning -BinaryPath $targetBinaryPath)) {
+if (-not $WhatIfPreference -and $targetBinaryPath -and (Test-TargetRunning -BinaryPath $targetBinaryPath)) {
     throw "Close the target browser before installing Widevine. Running binary: '$targetBinaryPath'."
 }
 
@@ -919,28 +982,28 @@ if (-not $PSCmdlet.ShouldProcess($targetWidevineRoot, $action)) {
 }
 
 New-Item -ItemType Directory -Path $workRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $targetWidevineRoot | Out-Null
+
+# Stage inside the target root so the final swap is a same-volume rename.
+# %TEMP% is frequently on a different drive, which would make Move fail.
+$stagePath = Join-Path $targetWidevineRoot ('.stage-' + [guid]::NewGuid().ToString('N'))
 
 try {
-    Invoke-WebRequest -UseBasicParsing -Uri $download.Url -OutFile $crxPath
+    $downloadUrl = Invoke-WidevineDownload `
+        -Urls $download.Urls `
+        -DestinationPath $crxPath `
+        -ExpectedSha256 $download.Sha256
 
-    $actualHash = Get-Sha256Hex -Path $crxPath
-    $expectedHash = $download.Sha256.ToLowerInvariant()
-    if ($actualHash -ne $expectedHash) {
-        throw "Downloaded Widevine payload hash mismatch. Expected '$expectedHash', got '$actualHash'."
-    }
+    Expand-Crx3Archive -CrxPath $crxPath -DestinationPath $stagePath
 
-    Expand-Crx3Archive -CrxPath $crxPath -DestinationPath $extractPath
-
-    $manifestVersion = Get-WidevineManifestVersion -VersionDirectory $extractPath
+    $manifestVersion = Get-WidevineManifestVersion -VersionDirectory $stagePath
     if ($manifestVersion -ne $download.Version) {
         throw "Widevine manifest version '$manifestVersion' does not match the update response '$($download.Version)'."
     }
 
-    if (-not (Test-WidevineLayout -VersionDirectory $extractPath -Architecture $resolvedArchitecture)) {
-        throw 'Extracted Widevine payload is missing required files.'
+    if (-not (Test-WidevineLayout -VersionDirectory $stagePath -Architecture $resolvedArchitecture)) {
+        throw "Extracted Widevine payload is missing required files for architecture '$resolvedArchitecture'."
     }
-
-    New-Item -ItemType Directory -Force -Path $targetWidevineRoot | Out-Null
 
     $backupDirectory = $null
     if (Test-Path -LiteralPath $destinationVersionDirectory) {
@@ -951,8 +1014,8 @@ try {
         }
     }
 
-    New-Item -ItemType Directory -Force -Path $destinationVersionDirectory | Out-Null
-    Copy-Item -Path (Join-Path $extractPath '*') -Destination $destinationVersionDirectory -Recurse -Force
+    # Atomic within the volume: the destination never exists in a partial state.
+    [System.IO.Directory]::Move($stagePath, $destinationVersionDirectory)
 
     Write-InstallerMarker `
         -MarkerPath $installerMarkerPath `
@@ -971,13 +1034,16 @@ try {
         InstalledWidevine    = $installedWidevineVersion
         WidevineVersion      = $download.Version
         Source               = 'Google component update service'
-        DownloadUrl          = $download.Url
+        DownloadUrl          = $downloadUrl
         DestinationDirectory = $destinationVersionDirectory
         Changed              = $true
         BackupDirectory      = $backupDirectory
         WorkDirectory        = if ($KeepWorkDir) { $workRoot } else { $null }
     }
 } finally {
+    if (Test-Path -LiteralPath $stagePath) {
+        Remove-Item -LiteralPath $stagePath -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if ((Test-Path -LiteralPath $workRoot) -and -not $KeepWorkDir) {
         Remove-Item -LiteralPath $workRoot -Recurse -Force
     }
