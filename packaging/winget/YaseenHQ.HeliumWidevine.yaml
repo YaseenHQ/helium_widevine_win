@@ -1,0 +1,7 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+# Template. Replace __VERSION__ before submitting to microsoft/winget-pkgs.
+PackageIdentifier: YaseenHQ.HeliumWidevine
+PackageVersion: __VERSION__
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Analyze and test
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tooling
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.0.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          if ($results) {
+            $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+          }
+          $blocking = @($results | Where-Object { $_.Severity -in 'Error', 'Warning' })
+          if ($blocking.Count) {
+            throw "PSScriptAnalyzer reported $($blocking.Count) error/warning finding(s)."
+          }
+          Write-Host 'PSScriptAnalyzer: clean.'
+
+      - name: Pester
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0 -Force
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'testResults.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: pester-results
+          path: testResults.xml
+
+  # The installer's whole job is to talk to Google's component service, so a
+  # green unit-test run can still hide a broken update request. Exercise the
+  # real endpoint against a scratch directory.
+  integration:
+    name: Live component-service install
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install into a scratch root
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'wv'
+          ./Install-Widevine.ps1 -Target Custom -TargetWidevineRoot $root -ProductVersion '151.0.7922.137'
+
+          $versionDir = Get-ChildItem -LiteralPath $root -Directory |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+            Select-Object -First 1
+          if (-not $versionDir) { throw 'No versioned CDM directory was created.' }
+
+          $dll = Join-Path $versionDir.FullName '_platform_specific\win_x64\widevinecdm.dll'
+          if (-not (Test-Path -LiteralPath $dll)) { throw "Missing CDM binary at $dll." }
+
+          Write-Host "Installed $($versionDir.Name), CDM $((Get-Item $dll).Length) bytes."
+
+      - name: Second run is idempotent
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'wv'
+          $result = ./Install-Widevine.ps1 -Target Custom -TargetWidevineRoot $root -ProductVersion '151.0.7922.137'
+          if ($result.Changed) { throw 'Second run reported a change; install is not idempotent.' }
+          Write-Host "Second run: Changed=$($result.Changed), Source=$($result.Source)"

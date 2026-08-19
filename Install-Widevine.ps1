@@ -21,11 +21,36 @@ param(
 
     [switch]$NoBackup,
 
-    [switch]$PurgeBackups
+    [switch]$PurgeBackups,
+
+    [switch]$InstallScheduledTask,
+
+    [switch]$RemoveScheduledTask,
+
+    [switch]$SkipIfBrowserRunning
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# PowerShell 5.1 inherits .NET's legacy default on some Windows builds, which
+# can still negotiate TLS 1.0. Google's endpoints require 1.2 or better.
+if ([Net.ServicePointManager]::SecurityProtocol -notmatch 'Tls12') {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+
+# Load up front with -WhatIf suppressed: lazy autoload would otherwise run the
+# module's own Set-Alias calls under -WhatIf and flood dry-run output.
+if (-not (Get-Module -Name CimCmdlets)) {
+    $previousWhatIfPreference = $WhatIfPreference
+    $WhatIfPreference = $false
+    try {
+        Import-Module CimCmdlets -ErrorAction SilentlyContinue | Out-Null
+    } finally {
+        $WhatIfPreference = $previousWhatIfPreference
+    }
+}
 
 $WidevineAppId = 'oimompecagnajdejgnnjijobebaeigek'
 $WidevineUpdateUrl = 'https://clients2.google.com/service/update2/json'
@@ -301,11 +326,11 @@ function Resolve-WidevineArchitecture {
         [string]$BinaryPath
     )
 
+    # Google publishes a distinct win_arm64 Widevine package, and Helium ships a
+    # native ARM64 build. Resolving arm64 to x64 installs a CDM the browser
+    # cannot load, so mirror the target binary's real architecture.
     if ($BinaryPath -and (Test-Path -LiteralPath $BinaryPath)) {
         $peArch = Get-PeArchitecture -Path $BinaryPath
-        if ($peArch -eq 'arm64') {
-            return 'x64'
-        }
         if ($peArch) {
             return $peArch
         }
@@ -313,7 +338,7 @@ function Resolve-WidevineArchitecture {
 
     switch (Get-HostArchitecture) {
         'x86'   { return 'x86' }
-        'arm64' { return 'x64' }
+        'arm64' { return 'arm64' }
         default { return 'x64' }
     }
 }
@@ -353,12 +378,20 @@ function Get-WidevineVersionInfo {
             continue
         }
 
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-        [pscustomobject]@{
-            VersionDirectory = $directory.FullName
-            Version          = [string]$manifest.version
-            ManifestPath     = $manifestPath
-            SortKey          = [version][string]$manifest.version
+        # One unreadable or malformed manifest must not abort discovery of the
+        # other installed versions.
+        try {
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            $manifestVersion = [string]$manifest.version
+            [pscustomobject]@{
+                VersionDirectory = $directory.FullName
+                Version          = $manifestVersion
+                ManifestPath     = $manifestPath
+                SortKey          = [version]$manifestVersion
+            }
+        } catch {
+            Write-Verbose "Skipping unreadable Widevine manifest '$manifestPath': $($_.Exception.Message)"
+            continue
         }
     }
 
@@ -393,11 +426,28 @@ function Test-WidevineLayout {
         }
     }
 
+    # Chromium's WidevineCdmComponentInstallerPolicy::VerifyInstallation rejects
+    # a CDM whose manifest lacks these keys, and a rejected component registers
+    # nothing at all -- silently, with no browser-side error. Catch it here
+    # instead, where we can say why.
+    try {
+        $manifest = Get-Content -LiteralPath (Join-Path $VersionDirectory 'manifest.json') -Raw | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+
+    foreach ($key in @('x-cdm-interface-versions', 'x-cdm-module-versions', 'x-cdm-codecs')) {
+        $property = $manifest.PSObject.Properties[$key]
+        if (-not $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return $false
+        }
+    }
+
     return $true
 }
 
 function Get-LatestStableChromeVersion {
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $ChromeStableVersionUrl
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $ChromeStableVersionUrl -TimeoutSec 30
     $payload = $response.Content | ConvertFrom-Json
     $version = $payload.versions[0].version
 
@@ -432,6 +482,9 @@ function Get-OsVersionString {
 }
 
 function New-WidevineUpdateRequestBody {
+    # Builds and returns a JSON string; the New- verb implies no state change.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '')]
     param(
         [Parameter(Mandatory = $true)]
         [string]$ProductVersion,
@@ -522,7 +575,8 @@ function Invoke-WidevineUpdateCheck {
         -Method Post `
         -Uri $WidevineUpdateUrl `
         -Headers $headers `
-        -Body $body
+        -Body $body `
+        -TimeoutSec 30
 
     $jsonText = (($response.Content -split "`r?`n") | Select-Object -Skip 1) -join "`n"
     $payload = $jsonText | ConvertFrom-Json
@@ -554,20 +608,344 @@ function Resolve-WidevineDownload {
         throw 'Widevine update response did not include a download operation.'
     }
 
-    $downloadUrl = $downloadOperation.urls |
+    # Google returns each mirror twice (http then https). Keep every HTTPS
+    # mirror so a single unreachable host does not fail the install.
+    $downloadUrls = @($downloadOperation.urls |
         ForEach-Object { $_.url } |
-        Where-Object { $_ -like 'https://*' } |
-        Select-Object -First 1
+        Where-Object { $_ -like 'https://*' })
 
-    if (-not $downloadUrl) {
+    if ($downloadUrls.Count -eq 0) {
         throw 'Widevine update response did not include a usable HTTPS download URL.'
+    }
+
+    $expectedSha256 = [string]$downloadOperation.out.sha256
+    if ([string]::IsNullOrWhiteSpace($expectedSha256)) {
+        throw 'Widevine update response did not include a SHA-256 for the payload.'
     }
 
     return [pscustomobject]@{
         Version = [string]$UpdateApp.updatecheck.nextversion
-        Url     = $downloadUrl
-        Sha256  = [string]$downloadOperation.out.sha256
+        Urls    = $downloadUrls
+        Url     = $downloadUrls[0]
+        Sha256  = $expectedSha256
     }
+}
+
+function Read-Asn1Length {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Data,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$Offset
+    )
+
+    $first = $Data[$Offset.Value]
+    $Offset.Value++
+
+    if ($first -lt 0x80) {
+        return [int]$first
+    }
+
+    $byteCount = $first -band 0x7F
+    if ($byteCount -eq 0 -or $byteCount -gt 4) {
+        throw 'Unsupported ASN.1 length encoding in the CRX public key.'
+    }
+
+    $length = 0
+    for ($i = 0; $i -lt $byteCount; $i++) {
+        $length = ($length -shl 8) -bor $Data[$Offset.Value]
+        $Offset.Value++
+    }
+
+    return $length
+}
+
+function Read-Asn1Tag {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Data,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$Offset,
+
+        [Parameter(Mandatory = $true)]
+        [byte]$Expected,
+
+        [Parameter(Mandatory = $true)]
+        [string]$What
+    )
+
+    if ($Data[$Offset.Value] -ne $Expected) {
+        throw ("Malformed CRX public key: expected {0} (tag 0x{1:X2}) but found 0x{2:X2}." -f
+            $What, $Expected, $Data[$Offset.Value])
+    }
+
+    $Offset.Value++
+    return (Read-Asn1Length -Data $Data -Offset $Offset)
+}
+
+function ConvertFrom-DerUnsignedInteger {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Bytes
+    )
+
+    # DER stores a leading zero byte to keep the value positive; RSAParameters
+    # wants the raw magnitude without it.
+    $start = 0
+    while ($start -lt ($Bytes.Length - 1) -and $Bytes[$start] -eq 0) {
+        $start++
+    }
+
+    return $Bytes[$start..($Bytes.Length - 1)]
+}
+
+function Get-RsaParametersFromSpki {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$SubjectPublicKeyInfo
+    )
+
+    # .NET Framework (which drives PowerShell 5.1) has no
+    # RSA.ImportSubjectPublicKeyInfo, so unwrap the DER by hand:
+    #   SEQUENCE { AlgorithmIdentifier, BIT STRING { RSAPublicKey } }
+    #   RSAPublicKey ::= SEQUENCE { INTEGER modulus, INTEGER publicExponent }
+    $offset = 0
+    [void](Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x30 -What 'SubjectPublicKeyInfo')
+
+    $algorithmLength = Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x30 -What 'AlgorithmIdentifier'
+    $offset += $algorithmLength
+
+    [void](Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x03 -What 'subjectPublicKey BIT STRING')
+    if ($SubjectPublicKeyInfo[$offset] -ne 0) {
+        throw 'Malformed CRX public key: unexpected unused-bit count in the BIT STRING.'
+    }
+    $offset++
+
+    [void](Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x30 -What 'RSAPublicKey')
+
+    $modulusLength = Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x02 -What 'modulus'
+    $modulus = $SubjectPublicKeyInfo[$offset..($offset + $modulusLength - 1)]
+    $offset += $modulusLength
+
+    $exponentLength = Read-Asn1Tag -Data $SubjectPublicKeyInfo -Offset ([ref]$offset) -Expected 0x02 -What 'publicExponent'
+    $exponent = $SubjectPublicKeyInfo[$offset..($offset + $exponentLength - 1)]
+
+    $parameters = New-Object System.Security.Cryptography.RSAParameters
+    $parameters.Modulus = ConvertFrom-DerUnsignedInteger -Bytes $modulus
+    $parameters.Exponent = ConvertFrom-DerUnsignedInteger -Bytes $exponent
+    return $parameters
+}
+
+function ConvertTo-CrxExtensionId {
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$SubjectPublicKeyInfo
+    )
+
+    # A Chromium extension/component ID is the first 16 bytes of the SHA-256 of
+    # the DER public key, with each nibble mapped 0-f onto a-p.
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha256.ComputeHash($SubjectPublicKeyInfo)
+    } finally {
+        $sha256.Dispose()
+    }
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($byte in $digest[0..15]) {
+        [void]$builder.Append([char](97 + ($byte -shr 4)))
+        [void]$builder.Append([char](97 + ($byte -band 0x0F)))
+    }
+
+    return $builder.ToString()
+}
+
+function Read-ProtobufFields {
+    # Plural is deliberate: this returns every field in the message.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Data
+    )
+
+    $fields = New-Object System.Collections.Generic.List[psobject]
+    $offset = 0
+
+    while ($offset -lt $Data.Length) {
+        # Field key varint: (fieldNumber << 3) | wireType
+        $key = [uint64]0
+        $shift = 0
+        do {
+            if ($offset -ge $Data.Length) {
+                throw 'Truncated CRX header: incomplete field key.'
+            }
+            $current = $Data[$offset]
+            $offset++
+            $key = $key -bor ([uint64]($current -band 0x7F) -shl $shift)
+            $shift += 7
+        } while ($current -band 0x80)
+
+        $fieldNumber = [int]($key -shr 3)
+        $wireType = [int]($key -band 0x07)
+
+        switch ($wireType) {
+            0 {
+                # Varint value; skip it.
+                do {
+                    $current = $Data[$offset]
+                    $offset++
+                } while ($current -band 0x80)
+            }
+            2 {
+                $length = [int]0
+                $shift = 0
+                do {
+                    $current = $Data[$offset]
+                    $offset++
+                    $length = $length -bor (($current -band 0x7F) -shl $shift)
+                    $shift += 7
+                } while ($current -band 0x80)
+
+                if (($offset + $length) -gt $Data.Length) {
+                    throw 'Truncated CRX header: length-delimited field overruns the buffer.'
+                }
+
+                $value = if ($length -eq 0) { , [byte[]]@() } else { , [byte[]]$Data[$offset..($offset + $length - 1)] }
+                $offset += $length
+
+                $fields.Add([pscustomobject]@{
+                    FieldNumber = $fieldNumber
+                    Value       = $value
+                })
+            }
+            5 { $offset += 4 }
+            1 { $offset += 8 }
+            default {
+                throw "Unsupported protobuf wire type '$wireType' in the CRX header."
+            }
+        }
+    }
+
+    return $fields
+}
+
+function Test-Crx3Signature {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CrxPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedExtensionId
+    )
+
+    $stream = [System.IO.File]::OpenRead($CrxPath)
+    $reader = [System.IO.BinaryReader]::new($stream)
+
+    try {
+        if ([System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(4)) -ne 'Cr24') {
+            throw 'Downloaded file is not a CRX archive.'
+        }
+
+        $crxVersion = $reader.ReadUInt32()
+        if ($crxVersion -ne 3) {
+            throw "Unsupported CRX version '$crxVersion'."
+        }
+
+        $headerSize = $reader.ReadUInt32()
+        $headerBytes = $reader.ReadBytes($headerSize)
+        if ($headerBytes.Length -ne $headerSize) {
+            throw 'Truncated CRX header.'
+        }
+
+        $payloadOffset = 12 + $headerSize
+        $fields = Read-ProtobufFields -Data $headerBytes
+
+        # CrxFileHeader field 10000 is signed_header_data (a SignedData message
+        # whose field 1 is the 16-byte crx_id); field 2 is the repeated
+        # sha256_with_rsa proof list.
+        $signedHeaderData = ($fields | Where-Object { $_.FieldNumber -eq 10000 } | Select-Object -First 1).Value
+        if ($null -eq $signedHeaderData) {
+            throw 'CRX header does not contain signed header data.'
+        }
+
+        $rsaProofs = @($fields | Where-Object { $_.FieldNumber -eq 2 })
+        if ($rsaProofs.Count -eq 0) {
+            throw 'CRX header does not contain an RSA signature proof.'
+        }
+
+        # The signature covers a domain-separated prefix, then the signed header
+        # data, then the ZIP payload.
+        $prefix = [System.Collections.Generic.List[byte]]::new()
+        $prefix.AddRange([System.Text.Encoding]::ASCII.GetBytes('CRX3 SignedData'))
+        $prefix.Add(0)
+        $prefix.AddRange([System.BitConverter]::GetBytes([uint32]$signedHeaderData.Length))
+        $prefix.AddRange($signedHeaderData)
+
+        $matchedId = $false
+        foreach ($proof in $rsaProofs) {
+            $proofFields = Read-ProtobufFields -Data $proof.Value
+            $publicKey = ($proofFields | Where-Object { $_.FieldNumber -eq 1 } | Select-Object -First 1).Value
+            $signature = ($proofFields | Where-Object { $_.FieldNumber -eq 2 } | Select-Object -First 1).Value
+
+            if ($null -eq $publicKey -or $null -eq $signature) {
+                continue
+            }
+
+            $extensionId = ConvertTo-CrxExtensionId -SubjectPublicKeyInfo $publicKey
+            if ($extensionId -ne $ExpectedExtensionId) {
+                continue
+            }
+
+            $matchedId = $true
+
+            # Hash incrementally: the payload is ~22 MB and need not be buffered.
+            $hasher = [System.Security.Cryptography.IncrementalHash]::CreateHash(
+                [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+            try {
+                $hasher.AppendData($prefix.ToArray())
+
+                $stream.Position = $payloadOffset
+                $buffer = New-Object byte[] 1048576
+                while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $hasher.AppendData($buffer, 0, $read)
+                }
+
+                $digest = $hasher.GetHashAndReset()
+            } finally {
+                $hasher.Dispose()
+            }
+
+            $rsa = [System.Security.Cryptography.RSA]::Create()
+            try {
+                $rsa.ImportParameters((Get-RsaParametersFromSpki -SubjectPublicKeyInfo $publicKey))
+                $verified = $rsa.VerifyHash(
+                    $digest,
+                    $signature,
+                    [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+                    [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+            } finally {
+                $rsa.Dispose()
+            }
+
+            if (-not $verified) {
+                throw "CRX signature verification failed for extension ID '$ExpectedExtensionId'."
+            }
+
+            return $true
+        }
+
+        if (-not $matchedId) {
+            throw ("No CRX signature was issued by the expected publisher. " +
+                "Extension ID '$ExpectedExtensionId' was not among the signing keys.")
+        }
+    } finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+
+    return $false
 }
 
 function Expand-Crx3Archive {
@@ -608,7 +986,60 @@ function Expand-Crx3Archive {
         $inputStream.Dispose()
     }
 
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $DestinationPath -Force
+    Expand-ZipArchive -ZipPath $zipPath -DestinationPath $DestinationPath
+}
+
+function Expand-ZipArchive {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ZipPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null
+    $destinationRoot = [System.IO.Path]::GetFullPath(
+        (Resolve-Path -LiteralPath $DestinationPath).Path.TrimEnd('\') + '\')
+
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        # Validate every entry before writing anything: a crafted archive must
+        # not be able to place files outside the destination (zip slip).
+        foreach ($entry in $archive.Entries) {
+            if ([string]::IsNullOrEmpty($entry.Name)) {
+                continue
+            }
+
+            $target = [System.IO.Path]::GetFullPath(
+                [System.IO.Path]::Combine($destinationRoot, $entry.FullName))
+
+            if (-not $target.StartsWith($destinationRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Archive entry '$($entry.FullName)' resolves outside the destination directory."
+            }
+        }
+
+        foreach ($entry in $archive.Entries) {
+            $target = [System.IO.Path]::GetFullPath(
+                [System.IO.Path]::Combine($destinationRoot, $entry.FullName))
+
+            if ([string]::IsNullOrEmpty($entry.Name)) {
+                New-Item -ItemType Directory -Force -Path $target | Out-Null
+                continue
+            }
+
+            $parent = [System.IO.Path]::GetDirectoryName($target)
+            if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            }
+
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+        }
+    } finally {
+        $archive.Dispose()
+    }
 }
 
 function Get-WidevineManifestVersion {
@@ -623,6 +1054,49 @@ function Get-WidevineManifestVersion {
     }
 
     return [string](Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).version
+}
+
+function Invoke-WidevineDownload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Urls,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedSha256
+    )
+
+    $expected = $ExpectedSha256.ToLowerInvariant()
+    $failures = New-Object System.Collections.Generic.List[string]
+
+    # Invoke-WebRequest renders a progress bar per chunk on PowerShell 5.1,
+    # which dominates runtime on multi-megabyte downloads.
+    $previousProgress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        foreach ($url in $Urls) {
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $DestinationPath -TimeoutSec 120
+            } catch {
+                $failures.Add("$url : $($_.Exception.Message)")
+                continue
+            }
+
+            $actual = Get-Sha256Hex -Path $DestinationPath
+            if ($actual -eq $expected) {
+                return $url
+            }
+
+            $failures.Add("$url : hash mismatch (expected '$expected', got '$actual')")
+            Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        $ProgressPreference = $previousProgress
+    }
+
+    throw "Widevine download failed from all $($Urls.Count) mirror(s):`n  " + ($failures -join "`n  ")
 }
 
 function Get-Sha256Hex {
@@ -717,6 +1191,10 @@ function Read-InstallerMarker {
 }
 
 function Remove-ManagedWidevine {
+    # Dry-run support is threaded through the caller's own ShouldProcess result
+    # and passed in as -WhatIfMode, so this does not declare SupportsShouldProcess.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '')]
     param(
         [Parameter(Mandatory = $true)]
         [string]$ResolvedTarget,
@@ -787,6 +1265,101 @@ function Remove-ManagedWidevine {
     }
 }
 
+$ScheduledTaskName = 'HeliumWidevineUpdate'
+
+function Register-WidevineUpdateTask {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ResolvedTarget,
+
+        [string]$ResolvedBinaryPath
+    )
+
+    if (-not (Get-Command -Name Register-ScheduledTask -ErrorAction SilentlyContinue)) {
+        throw 'The ScheduledTasks module is unavailable, so the update task cannot be registered.'
+    }
+
+    $argumentList = @(
+        '-NoProfile'
+        '-ExecutionPolicy'
+        'Bypass'
+        '-WindowStyle'
+        'Hidden'
+        '-File'
+        ('"{0}"' -f $ScriptPath)
+        '-Target'
+        $ResolvedTarget
+        '-SkipIfBrowserRunning'
+    )
+
+    if ($ResolvedBinaryPath) {
+        $argumentList += @('-TargetBinaryPath', ('"{0}"' -f $ResolvedBinaryPath))
+    }
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($argumentList -join ' ')
+
+    # Weekly only. An -AtLogOn trigger requires elevation to register, and this
+    # installer is deliberately per-user, so it would fail with "Access is
+    # denied" for a normal user. -StartWhenAvailable below already covers the
+    # case a logon trigger was meant to handle: a machine that was powered off
+    # at the scheduled time runs the task as soon as it can afterwards.
+    $triggers = @(
+        New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '03:00'
+    )
+
+    $settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 30) `
+        -MultipleInstances IgnoreNew
+
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+        -LogonType Interactive
+
+    try {
+        Register-ScheduledTask `
+            -TaskName $ScheduledTaskName `
+            -Action $action `
+            -Trigger $triggers `
+            -Settings $settings `
+            -Principal $principal `
+            -Description 'Keeps the Widevine CDM in Helium current with Google component releases.' `
+            -Force -ErrorAction Stop | Out-Null
+    } catch [Microsoft.Management.Infrastructure.CimException] {
+        if ($_.Exception.Message -match 'Access is denied') {
+            throw ("Registering the scheduled task was denied. Task Scheduler is " +
+                   "likely restricted by policy on this machine. Widevine itself " +
+                   "installs fine without the task -- rerun without " +
+                   "-InstallScheduledTask, and update manually when needed.")
+        }
+        throw
+    }
+
+    return $ScheduledTaskName
+}
+
+function Unregister-WidevineUpdateTask {
+    if (-not (Get-Command -Name Unregister-ScheduledTask -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    if (-not (Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false
+    return $true
+}
+
+# Dot-sourcing this file loads its functions for testing without running the
+# installer. Everything above this line is declarations; everything below acts.
+if ($MyInvocation.InvocationName -eq '.') {
+    return
+}
+
 $resolvedTarget = $Target
 $targetBinaryPath = Get-TargetBinaryPath -ResolvedTarget $resolvedTarget -ExplicitPath $TargetBinaryPath
 $targetWidevineRoot = Get-TargetWidevineRoot -ResolvedTarget $resolvedTarget -ExplicitPath $TargetWidevineRoot
@@ -798,8 +1371,56 @@ $productVersion = Resolve-ProductVersion -RequestedVersion $ProductVersion -Targ
 $currentWidevine = Get-WidevineVersionInfo -WidevineRoot $targetWidevineRoot
 $installedWidevineVersion = if ($currentWidevine) { $currentWidevine.Version } else { '0.0.0.0' }
 
-if ($targetBinaryPath -and (Test-TargetRunning -BinaryPath $targetBinaryPath)) {
+if ($Uninstall -and $InstallScheduledTask) {
+    throw 'Use -Uninstall or -InstallScheduledTask, not both: scheduling an updater for a CDM you are removing would reinstall it.'
+}
+
+if ($RemoveScheduledTask) {
+    $taskWasRemoved = Unregister-WidevineUpdateTask
+
+    # Removing the task is a complete action on its own, but it also composes
+    # with the other verbs -- notably `-Uninstall -RemoveScheduledTask`, which
+    # must go on to remove the CDM as well.
+    if (-not $InstallScheduledTask -and -not $Uninstall) {
+        [pscustomobject]@{
+            ScheduledTask = $ScheduledTaskName
+            Removed       = $taskWasRemoved
+        }
+        return
+    }
+
+    # Composing with another verb: report this as a message rather than a second
+    # object, so the pipeline keeps one shape and the default table stays legible.
+    Write-Host "Scheduled task '$ScheduledTaskName': $(if ($taskWasRemoved) { 'removed' } else { 'not registered' })"
+}
+
+if (-not $WhatIfPreference -and $targetBinaryPath -and (Test-TargetRunning -BinaryPath $targetBinaryPath)) {
+    # The scheduled task runs unattended, where a running browser is an ordinary
+    # "try again later" rather than a failure worth reporting to Task Scheduler.
+    if ($SkipIfBrowserRunning) {
+        [pscustomobject]@{
+            Target           = $resolvedTarget
+            TargetBinaryPath = $targetBinaryPath
+            Changed          = $false
+            Skipped          = 'Target browser is running.'
+        }
+        return
+    }
+
     throw "Close the target browser before installing Widevine. Running binary: '$targetBinaryPath'."
+}
+
+if ($InstallScheduledTask) {
+    $registeredTask = Register-WidevineUpdateTask `
+        -ScriptPath $PSCommandPath `
+        -ResolvedTarget $resolvedTarget `
+        -ResolvedBinaryPath $targetBinaryPath
+
+    # Same reasoning as the removal path: this runs alongside an install, so
+    # report it as a message instead of emitting a second object shape.
+    Write-Host ("Scheduled task '{0}' registered for {1} (weekly, Sunday 03:00)." -f
+        $registeredTask, [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+
 }
 
 if ($Uninstall) {
@@ -898,7 +1519,6 @@ if ((Test-Path -LiteralPath $destinationVersionDirectory) -and
 
 $workRoot = Join-Path $env:TEMP ("widevine-download-" + [guid]::NewGuid().ToString('N'))
 $crxPath = Join-Path $workRoot 'widevine.crx3'
-$extractPath = Join-Path $workRoot 'extracted'
 
 $action = "Install Widevine $($download.Version) into '$targetWidevineRoot'"
 if (-not $PSCmdlet.ShouldProcess($targetWidevineRoot, $action)) {
@@ -919,28 +1539,32 @@ if (-not $PSCmdlet.ShouldProcess($targetWidevineRoot, $action)) {
 }
 
 New-Item -ItemType Directory -Path $workRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $targetWidevineRoot | Out-Null
+
+# Stage inside the target root so the final swap is a same-volume rename.
+# %TEMP% is frequently on a different drive, which would make Move fail.
+$stagePath = Join-Path $targetWidevineRoot ('.stage-' + [guid]::NewGuid().ToString('N'))
 
 try {
-    Invoke-WebRequest -UseBasicParsing -Uri $download.Url -OutFile $crxPath
+    $downloadUrl = Invoke-WidevineDownload `
+        -Urls $download.Urls `
+        -DestinationPath $crxPath `
+        -ExpectedSha256 $download.Sha256
 
-    $actualHash = Get-Sha256Hex -Path $crxPath
-    $expectedHash = $download.Sha256.ToLowerInvariant()
-    if ($actualHash -ne $expectedHash) {
-        throw "Downloaded Widevine payload hash mismatch. Expected '$expectedHash', got '$actualHash'."
-    }
+    # The SHA-256 above only proves the bytes match what the update server
+    # described. This proves Google actually signed them.
+    [void](Test-Crx3Signature -CrxPath $crxPath -ExpectedExtensionId $WidevineAppId)
 
-    Expand-Crx3Archive -CrxPath $crxPath -DestinationPath $extractPath
+    Expand-Crx3Archive -CrxPath $crxPath -DestinationPath $stagePath
 
-    $manifestVersion = Get-WidevineManifestVersion -VersionDirectory $extractPath
+    $manifestVersion = Get-WidevineManifestVersion -VersionDirectory $stagePath
     if ($manifestVersion -ne $download.Version) {
         throw "Widevine manifest version '$manifestVersion' does not match the update response '$($download.Version)'."
     }
 
-    if (-not (Test-WidevineLayout -VersionDirectory $extractPath -Architecture $resolvedArchitecture)) {
-        throw 'Extracted Widevine payload is missing required files.'
+    if (-not (Test-WidevineLayout -VersionDirectory $stagePath -Architecture $resolvedArchitecture)) {
+        throw "Extracted Widevine payload is missing required files for architecture '$resolvedArchitecture'."
     }
-
-    New-Item -ItemType Directory -Force -Path $targetWidevineRoot | Out-Null
 
     $backupDirectory = $null
     if (Test-Path -LiteralPath $destinationVersionDirectory) {
@@ -951,8 +1575,8 @@ try {
         }
     }
 
-    New-Item -ItemType Directory -Force -Path $destinationVersionDirectory | Out-Null
-    Copy-Item -Path (Join-Path $extractPath '*') -Destination $destinationVersionDirectory -Recurse -Force
+    # Atomic within the volume: the destination never exists in a partial state.
+    [System.IO.Directory]::Move($stagePath, $destinationVersionDirectory)
 
     Write-InstallerMarker `
         -MarkerPath $installerMarkerPath `
@@ -971,13 +1595,16 @@ try {
         InstalledWidevine    = $installedWidevineVersion
         WidevineVersion      = $download.Version
         Source               = 'Google component update service'
-        DownloadUrl          = $download.Url
+        DownloadUrl          = $downloadUrl
         DestinationDirectory = $destinationVersionDirectory
         Changed              = $true
         BackupDirectory      = $backupDirectory
         WorkDirectory        = if ($KeepWorkDir) { $workRoot } else { $null }
     }
 } finally {
+    if (Test-Path -LiteralPath $stagePath) {
+        Remove-Item -LiteralPath $stagePath -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if ((Test-Path -LiteralPath $workRoot) -and -not $KeepWorkDir) {
         Remove-Item -LiteralPath $workRoot -Recurse -Force
     }

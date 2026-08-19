@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $env:GITHUB_REF -replace '^refs/tags/v', ''
+          } else {
+            '${{ github.event.inputs.version }}'
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version '$version' is not in MAJOR.MINOR.PATCH form."
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Building version $version"
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Verify before packaging
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.0.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          Import-Module Pester -MinimumVersion 5.0.0 -Force
+
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Normal'
+          Invoke-Pester -Configuration $config
+
+      - name: Build artifacts
+        shell: pwsh
+        run: ./packaging/Build-Release.ps1 -Version '${{ steps.version.outputs.version }}'
+
+      - name: Smoke test the built installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem ./dist -Filter 'HeliumWidevineSetup-*.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'No installer was produced.' }
+
+          # /VERYSILENT with no tasks selected: verifies the package installs and
+          # uninstalls cleanly without downloading anything.
+          $dir = Join-Path $env:RUNNER_TEMP 'hwv'
+          Start-Process -FilePath $setup.FullName -Wait -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=', "/DIR=$dir"
+          )
+
+          if (-not (Test-Path (Join-Path $dir 'Install-Widevine.ps1'))) {
+            throw 'Installer did not place Install-Widevine.ps1.'
+          }
+          Write-Host 'Installer smoke test passed.'
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-artifacts
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            **winget**
+            ```
+            winget install YaseenHQ.HeliumWidevine
+            ```
+
+            **Installer** — download `HeliumWidevineSetup-${{ steps.version.outputs.version }}.exe` below.
+
+            **Portable** — download the `-portable.zip` and run `install-widevine.cmd`.
+
+            **One-liner**
+            ```powershell
+            irm https://raw.githubusercontent.com/YaseenHQ/helium_widevine_win/main/install.ps1 | iex
+            ```
+
+            Verify any download against `checksums.txt`.
+
+            > This restores Widevine **L3** playback. See the README for why L1 is not achievable.

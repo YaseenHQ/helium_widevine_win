@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+# Template. Replace __VERSION__ and __SHA256__ before submitting.
+# __SHA256__ is the installer's entry in the release checksums.txt.
+PackageIdentifier: YaseenHQ.HeliumWidevine
+PackageVersion: __VERSION__
+InstallerType: inno
+Scope: user
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+UpgradeBehavior: install
+ReleaseDate: __RELEASE_DATE__
+Installers:
+  # One installer entry covers every architecture: the package is a PowerShell
+  # payload that selects the matching CDM at run time from the target browser's
+  # own PE header.
+  - Architecture: neutral
+    InstallerUrl: https://github.com/YaseenHQ/helium_widevine_win/releases/download/v__VERSION__/HeliumWidevineSetup-__VERSION__.exe
+    InstallerSha256: __SHA256__
+ManifestType: installer
+ManifestVersion: 1.6.0

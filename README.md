@@ -3,8 +3,70 @@
 Windows Widevine installer for Helium.
 
 It downloads Widevine directly from Google's component update service, verifies
-the payload hash, extracts the CRX3, and installs a versioned `WidevineCdm`
-directory into Helium's user data profile.
+the payload hash *and Google's CRX3 signature*, extracts the archive, and
+installs a versioned `WidevineCdm` directory into Helium's user data profile.
+
+## What you get, and what you don't
+
+**This restores Widevine L3 playback.** That is the ceiling, and no installer
+can raise it.
+
+Helium is built with `enable_widevine=true` but ships no CDM, because it has no
+licence to redistribute one. Chromium's component installer scans
+`<User Data>\WidevineCdm\` at startup, picks the highest version-named
+subdirectory with a valid manifest, and registers it. This script fills that
+directory, so the CDM registers exactly as if Chrome's own updater had
+installed it.
+
+What it cannot do is get you **L1 / verified media path**. On Windows the CDM
+performs *host verification* against Google-signed `.sig` files for the
+browser's own binaries. Those come from Google's signing infrastructure and
+Helium cannot have them, so the CDM runs unverified and falls back to L3
+software decryption.
+
+In practice that means:
+
+- Netflix tops out around 540p-720p
+- Disney+, Max and Prime Video behave similarly
+- A few services refuse playback outright rather than downgrade
+
+If you need 1080p+ on those services, this is a signing and licensing gate, not
+a missing-files problem. Please don't file that as a bug here.
+
+## Install
+
+**winget** (preinstalled on Windows 11)
+
+```
+winget install YaseenHQ.HeliumWidevine
+```
+
+**Installer** — download `HeliumWidevineSetup-<version>.exe` from
+[Releases](https://github.com/YaseenHQ/helium_widevine_win/releases). Per-user,
+no admin required. Setup offers to install Widevine and register the
+auto-update task, and uninstall reverses both.
+
+**Portable** — download the `-portable.zip` from Releases and extract it.
+
+**One-liner** — convenient, but see the note below.
+
+```powershell
+irm https://raw.githubusercontent.com/YaseenHQ/helium_widevine_win/main/install.ps1 | iex
+```
+
+This resolves the latest release, verifies the payload against the published
+`checksums.txt`, and runs it. To pass arguments, build a script block instead:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/YaseenHQ/helium_widevine_win/main/install.ps1))) -InstallScheduledTask
+```
+
+> Antivirus commonly flags `irm ... | iex` regardless of what it fetches,
+> because download-and-execute one-liners are a known malware delivery pattern.
+> Prefer the installer or portable zip if that matters to you. See
+> [If antivirus or SmartScreen complains](#if-antivirus-or-smartscreen-complains).
+
+Every release ships a `checksums.txt`; verify your download against it.
 
 ## Quick Start
 
@@ -32,26 +94,49 @@ Uninstall and remove backups:
 install-widevine.cmd -Uninstall -PurgeBackups
 ```
 
+## Keeping it up to date
+
+Google ships new Widevine builds periodically, so a one-off install will fall
+behind. The installer can register a scheduled task that re-runs it:
+
+```cmd
+install-widevine.cmd -InstallScheduledTask
+```
+
+The task runs weekly (Sunday 03:00) as the current user, with no window. If the
+machine is off at that time it runs as soon as it can afterwards. If Helium is
+running when it fires, it exits cleanly and retries on the next trigger instead
+of reporting a failure.
+
+It registers without administrator rights. A logon trigger would need
+elevation, which is why the schedule is weekly-only.
+
+Remove it with:
+
+```cmd
+install-widevine.cmd -RemoveScheduledTask
+```
+
 ## Options
 
 Use a nonstandard Helium binary path:
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
+PowerShell -ExecutionPolicy Bypass -File .\Install-Widevine.ps1 `
   -TargetBinaryPath "D:\Apps\Helium\Application\chrome.exe"
 ```
 
 Store backups somewhere else:
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
+PowerShell -ExecutionPolicy Bypass -File .\Install-Widevine.ps1 `
   -BackupRoot "$env:LOCALAPPDATA\helium-widevine-backups"
 ```
 
 Keep the temporary work directory:
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
+PowerShell -ExecutionPolicy Bypass -File .\Install-Widevine.ps1 `
   -KeepWorkDir
 ```
 
@@ -69,16 +154,71 @@ PowerShell -ExecutionPolicy Bypass -File .\use-from-google-chrome.ps1 `
   file and refuses to remove untracked layouts.
 - The Omaha update request sends OS version, architecture, and memory info to
   Google as part of the standard update protocol.
+- Downloads are checked twice: the SHA-256 from the update response, and the
+  CRX3 signature. The signature check derives the publisher's extension ID from
+  the key embedded in the archive and requires it to match Widevine's component
+  ID, so a payload that Google did not sign is refused even if the update
+  response vouched for it.
+
+## If antivirus or SmartScreen complains
+
+Expect this, and expect it to be a false positive. This tool does three things
+heuristic scanners treat as suspicious in combination: it downloads a binary
+from the internet, writes a DLL into a browser's directory, and (via the
+one-liner) runs a script fetched over the network.
+
+Common reports:
+
+- **`Trojan:Win32/ClickFix.*`** on the `irm ... | iex` one-liner. ClickFix is a
+  social-engineering technique whose payload is a download-and-execute
+  one-liner, so the shape matches even though the source and behaviour do not.
+  If this bothers you, use the installer or the portable zip instead; the
+  one-liner is a convenience, not the recommended path.
+- **SmartScreen "Windows protected your PC"** on the installer. The releases are
+  not code-signed yet, and SmartScreen reputation is earned per-signature over
+  time. Click *More info* then *Run anyway*, or verify the download against
+  `checksums.txt` first.
+
+What you can verify yourself, rather than taking the above on trust:
+
+- Every release ships a `checksums.txt`. Compare it with
+  `Get-FileHash <file> -Algorithm SHA256`.
+- The CDM itself is fetched from Google's own component update service, the
+  same endpoint Chrome uses, and is checked twice: against the SHA-256 in the
+  update response, and against Google's CRX3 signature.
+- The whole thing is a readable PowerShell script. Nothing is compiled or
+  obfuscated, so you can audit exactly what it does before running it.
+
+If you would rather not run any of it unattended, `-WhatIf` shows what would
+happen and changes nothing:
+
+```cmd
+install-widevine.cmd -WhatIf
+```
+
+## Building a release
+
+```powershell
+.\packaging\Build-Release.ps1 -Version 1.0.0
+```
+
+Produces the portable zip, the Inno Setup installer, and `checksums.txt` in
+`dist/`. Pass `-SkipInstaller` if Inno Setup is not installed. Pushing a
+`v<version>` tag runs the same build in CI and publishes a release.
+
+See [packaging/winget](packaging/winget) for submitting a version to winget.
 
 ## Requirements
 
-- Windows (x64 or x86; ARM64 works via x64 emulation)
+- Windows x64, x86, or ARM64. Google publishes a separate `win_arm64` CDM and
+  Helium ships a native ARM64 build; the installer matches the CDM to the
+  architecture of the target binary rather than assuming emulation.
 - PowerShell 5.1 or later
 - Internet access to `clients2.google.com` and `versionhistory.googleapis.com`
 
 ## Scope
 
-- This installs Widevine only.
+- This installs Widevine only, at L3. See the ceiling described above.
 - It does not copy files from Chrome, Edge, or Brave.
 - It does not override Helium services or proxy update traffic.
 - Helium's own `chrome://components` updater behavior is a separate upstream
