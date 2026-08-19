@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+# Template. Replace __VERSION__ before submitting.
+PackageIdentifier: YaseenHQ.HeliumWidevine
+PackageVersion: __VERSION__
+PackageLocale: en-US
+Publisher: YaseenHQ
+PublisherUrl: https://github.com/YaseenHQ
+PublisherSupportUrl: https://github.com/YaseenHQ/helium_widevine_win/issues
+PackageName: Helium Widevine
+PackageUrl: https://github.com/YaseenHQ/helium_widevine_win
+License: MIT
+LicenseUrl: https://github.com/YaseenHQ/helium_widevine_win/blob/main/LICENSE
+ShortDescription: Installs the Widevine CDM into the Helium browser.
+Description: |-
+  Helium is built with Widevine support enabled but ships no CDM, because it
+  has no licence to redistribute one. This installer downloads the official
+  Widevine component from Google's component update service, verifies both its
+  SHA-256 and Google's CRX3 signature, and installs it into Helium's user data
+  profile where Chromium's component installer picks it up at startup.
+
+  It restores Widevine L3 playback. L1 (verified media path) is not achievable
+  for any unofficial Chromium build, because the CDM's host verification
+  requires Google-signed binaries. Expect roughly 540p-720p on the major
+  streaming services.
+
+  An optional scheduled task keeps the CDM current as Google publishes new
+  builds.
+Moniker: helium-widevine
+Tags:
+  - browser
+  - chromium
+  - drm
+  - helium
+  - streaming
+  - widevine
+ReleaseNotesUrl: https://github.com/YaseenHQ/helium_widevine_win/releases/tag/v__VERSION__
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

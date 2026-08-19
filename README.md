@@ -33,6 +33,36 @@ In practice that means:
 If you need 1080p+ on those services, this is a signing and licensing gate, not
 a missing-files problem. Please don't file that as a bug here.
 
+## Install
+
+**winget** (preinstalled on Windows 11)
+
+```
+winget install YaseenHQ.HeliumWidevine
+```
+
+**Installer** — download `HeliumWidevineSetup-<version>.exe` from
+[Releases](https://github.com/YaseenHQ/helium_widevine_win/releases). Per-user,
+no admin required. Setup offers to install Widevine and register the
+auto-update task, and uninstall reverses both.
+
+**One-liner**
+
+```powershell
+irm https://raw.githubusercontent.com/YaseenHQ/helium_widevine_win/main/install.ps1 | iex
+```
+
+This resolves the latest release, verifies the payload against the published
+`checksums.txt`, and runs it. To pass arguments, build a script block instead:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/YaseenHQ/helium_widevine_win/main/install.ps1))) -InstallScheduledTask
+```
+
+**Portable** — download the `-portable.zip` from Releases and extract it.
+
+Every release ships a `checksums.txt`; verify your download against it.
+
 ## Quick Start
 
 Install for Helium:
@@ -120,6 +150,18 @@ PowerShell -ExecutionPolicy Bypass -File .\Install-Widevine.ps1 `
   the key embedded in the archive and requires it to match Widevine's component
   ID, so a payload that Google did not sign is refused even if the update
   response vouched for it.
+
+## Building a release
+
+```powershell
+.\packaging\Build-Release.ps1 -Version 1.0.0
+```
+
+Produces the portable zip, the Inno Setup installer, and `checksums.txt` in
+`dist/`. Pass `-SkipInstaller` if Inno Setup is not installed. Pushing a
+`v<version>` tag runs the same build in CI and publishes a release.
+
+See [packaging/winget](packaging/winget) for submitting a version to winget.
 
 ## Requirements
 
