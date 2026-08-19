@@ -1301,10 +1301,13 @@ function Register-WidevineUpdateTask {
 
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($argumentList -join ' ')
 
-    # Weekly, plus a logon trigger so a machine that was off still catches up.
+    # Weekly only. An -AtLogOn trigger requires elevation to register, and this
+    # installer is deliberately per-user, so it would fail with "Access is
+    # denied" for a normal user. -StartWhenAvailable below already covers the
+    # case a logon trigger was meant to handle: a machine that was powered off
+    # at the scheduled time runs the task as soon as it can afterwards.
     $triggers = @(
-        (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '03:00')
-        (New-ScheduledTaskTrigger -AtLogOn)
+        New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '03:00'
     )
 
     $settings = New-ScheduledTaskSettingsSet `
@@ -1316,14 +1319,24 @@ function Register-WidevineUpdateTask {
         -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
         -LogonType Interactive
 
-    Register-ScheduledTask `
-        -TaskName $ScheduledTaskName `
-        -Action $action `
-        -Trigger $triggers `
-        -Settings $settings `
-        -Principal $principal `
-        -Description 'Keeps the Widevine CDM in Helium current with Google component releases.' `
-        -Force | Out-Null
+    try {
+        Register-ScheduledTask `
+            -TaskName $ScheduledTaskName `
+            -Action $action `
+            -Trigger $triggers `
+            -Settings $settings `
+            -Principal $principal `
+            -Description 'Keeps the Widevine CDM in Helium current with Google component releases.' `
+            -Force -ErrorAction Stop | Out-Null
+    } catch [Microsoft.Management.Infrastructure.CimException] {
+        if ($_.Exception.Message -match 'Access is denied') {
+            throw ("Registering the scheduled task was denied. Task Scheduler is " +
+                   "likely restricted by policy on this machine. Widevine itself " +
+                   "installs fine without the task -- rerun without " +
+                   "-InstallScheduledTask, and update manually when needed.")
+        }
+        throw
+    }
 
     return $ScheduledTaskName
 }
@@ -1358,15 +1371,27 @@ $productVersion = Resolve-ProductVersion -RequestedVersion $ProductVersion -Targ
 $currentWidevine = Get-WidevineVersionInfo -WidevineRoot $targetWidevineRoot
 $installedWidevineVersion = if ($currentWidevine) { $currentWidevine.Version } else { '0.0.0.0' }
 
-if ($RemoveScheduledTask) {
-    [pscustomobject]@{
-        ScheduledTask = $ScheduledTaskName
-        Removed       = (Unregister-WidevineUpdateTask)
-    }
+if ($Uninstall -and $InstallScheduledTask) {
+    throw 'Use -Uninstall or -InstallScheduledTask, not both: scheduling an updater for a CDM you are removing would reinstall it.'
+}
 
-    if (-not $InstallScheduledTask) {
+if ($RemoveScheduledTask) {
+    $taskWasRemoved = Unregister-WidevineUpdateTask
+
+    # Removing the task is a complete action on its own, but it also composes
+    # with the other verbs -- notably `-Uninstall -RemoveScheduledTask`, which
+    # must go on to remove the CDM as well.
+    if (-not $InstallScheduledTask -and -not $Uninstall) {
+        [pscustomobject]@{
+            ScheduledTask = $ScheduledTaskName
+            Removed       = $taskWasRemoved
+        }
         return
     }
+
+    # Composing with another verb: report this as a message rather than a second
+    # object, so the pipeline keeps one shape and the default table stays legible.
+    Write-Host "Scheduled task '$ScheduledTaskName': $(if ($taskWasRemoved) { 'removed' } else { 'not registered' })"
 }
 
 if (-not $WhatIfPreference -and $targetBinaryPath -and (Test-TargetRunning -BinaryPath $targetBinaryPath)) {
@@ -1391,12 +1416,11 @@ if ($InstallScheduledTask) {
         -ResolvedTarget $resolvedTarget `
         -ResolvedBinaryPath $targetBinaryPath
 
-    [pscustomobject]@{
-        ScheduledTask = $registeredTask
-        Registered    = $true
-        RunsAs        = ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
-        Schedule      = 'Weekly (Sunday 03:00) and at logon'
-    }
+    # Same reasoning as the removal path: this runs alongside an install, so
+    # report it as a message instead of emitting a second object shape.
+    Write-Host ("Scheduled task '{0}' registered for {1} (weekly, Sunday 03:00)." -f
+        $registeredTask, [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+
 }
 
 if ($Uninstall) {

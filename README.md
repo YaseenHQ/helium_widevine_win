@@ -103,9 +103,13 @@ behind. The installer can register a scheduled task that re-runs it:
 install-widevine.cmd -InstallScheduledTask
 ```
 
-The task runs weekly (Sunday 03:00) and at logon, as the current user, with no
-window. If Helium is running when it fires, it exits cleanly and retries on the
-next trigger instead of reporting a failure.
+The task runs weekly (Sunday 03:00) as the current user, with no window. If the
+machine is off at that time it runs as soon as it can afterwards. If Helium is
+running when it fires, it exits cleanly and retries on the next trigger instead
+of reporting a failure.
+
+It registers without administrator rights. A logon trigger would need
+elevation, which is why the schedule is weekly-only.
 
 Remove it with:
 

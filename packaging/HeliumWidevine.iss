@@ -44,7 +44,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "installnow"; Description: "Install Widevine into Helium now"; GroupDescription: "Actions:"
-Name: "scheduledtask"; Description: "Keep Widevine up to date automatically (weekly and at logon)"; GroupDescription: "Actions:"
+Name: "scheduledtask"; Description: "Keep Widevine up to date automatically (weekly)"; GroupDescription: "Actions:"
 
 [Files]
 Source: "..\{#ScriptName}"; DestDir: "{app}"; Flags: ignoreversion
