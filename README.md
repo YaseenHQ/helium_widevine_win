@@ -1,5 +1,7 @@
 # helium-widevine-windows
 
+Point this repo to your agent
+
 Windows Widevine installer for Helium.
 
 It downloads Widevine directly from Google's component update service, verifies
